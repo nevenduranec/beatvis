@@ -1,0 +1,1100 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Audio Spectrum Visualizer</title>
+    <style>
+      body {
+        background-color: #000;
+        margin: 0;
+        overflow: hidden;
+        font-family: Arial, sans-serif;
+      }
+      canvas {
+        display: block;
+      }
+      .controls {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        background: rgba(0, 0, 0, 0.7);
+        padding: 15px;
+        border-radius: 5px;
+        color: white;
+        z-index: 100;
+      }
+      .control-group {
+        margin-bottom: 10px;
+      }
+      label {
+        display: inline-block;
+        width: 120px;
+        font-size: 12px;
+      }
+      input[type="range"] {
+        width: 150px;
+      }
+      select {
+        width: 150px;
+        padding: 2px;
+        background: #333;
+        color: white;
+        border: 1px solid #555;
+      }
+      .value {
+        font-weight: bold;
+        color: #4caf50;
+      }
+      .fullscreen-btn {
+        position: fixed;
+        right: 12px;
+        bottom: 12px;
+        z-index: 102;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        background: rgba(0, 0, 0, 0.7);
+        color: #fff;
+        font-size: 14px;
+        line-height: 1;
+        cursor: pointer;
+        user-select: none;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .fullscreen-btn:hover {
+        background: rgba(0, 0, 0, 0.85);
+      }
+      .fullscreen-btn:active {
+        transform: translateY(1px);
+      }
+      .fullscreen-btn:focus-visible {
+        outline: 2px solid rgba(76, 175, 80, 0.85);
+        outline-offset: 2px;
+      }
+
+      /* Hide controls when fullscreen */
+      :fullscreen .controls {
+        display: none;
+      }
+      :-webkit-full-screen .controls {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="controls">
+      <div class="control-group">
+        <label>Bars: <span class="value" id="barsValue">64</span></label>
+        <input
+          type="range"
+          id="barsSlider"
+          min="8"
+          max="128"
+          value="64"
+          step="4"
+        />
+      </div>
+      <div class="control-group">
+        <label
+          >Smoothing: <span class="value" id="smoothingValue">0.7</span></label
+        >
+        <input
+          type="range"
+          id="smoothingSlider"
+          min="0"
+          max="0.95"
+          value="0.7"
+          step="0.05"
+        />
+      </div>
+      <div class="control-group">
+        <label
+          >Sensitivity:
+          <span class="value" id="sensitivityValue">45000</span></label
+        >
+        <input
+          type="range"
+          id="sensitivitySlider"
+          min="10000"
+          max="100000"
+          value="45000"
+          step="5000"
+        />
+      </div>
+      <div class="control-group">
+        <label>Color Mode:</label>
+        <select id="colorMode">
+          <option value="rainbow">Rainbow</option>
+          <option value="white">White</option>
+        </select>
+      </div>
+      <div class="control-group">
+        <label>Levels Type:</label>
+        <select id="visualizationMode">
+          <option value="bars" selected>Bars</option>
+          <option value="waves">Waves</option>
+          <option value="dots">Dot Matrix</option>
+          <option value="radial">Radial Burst</option>
+          <option value="terrain">3D Terrain</option>
+          <option value="particles">Particle Field</option>
+        </select>
+      </div>
+      <div class="control-group" id="peakFalloffGroup">
+        <label>Peak Falloff: <span class="value" id="peakFalloffValue">0.10</span></label>
+        <input
+          type="range"
+          id="peakFalloffSlider"
+          min="0"
+          max="2"
+          value="0.1"
+          step="0.05"
+        />
+      </div>
+      <div class="control-group" id="peakSettings">
+        <label for="peakToggle">Show Peaks:</label>
+        <input type="checkbox" id="peakToggle" checked />
+      </div>
+      <div class="control-group" id="barGapGroup">
+        <label>Bar Gap: <span class="value" id="gapValue">10</span></label>
+        <input
+          type="range"
+          id="gapSlider"
+          min="0"
+          max="10"
+          value="10"
+          step="1"
+        />
+      </div>
+      <div class="control-group" id="particleIntensityGroup">
+        <label>Particle Intensity: <span class="value" id="particleIntensityValue">1.00</span></label>
+        <input
+          type="range"
+          id="particleIntensitySlider"
+          min="0.1"
+          max="2"
+          value="1"
+          step="0.05"
+        />
+      </div>
+    </div>
+    <canvas id="visualizer"></canvas>
+    <div
+      id="status"
+      style="
+        position: absolute;
+        left: 10px;
+        top: 10px;
+        color: #fff;
+        background: rgba(0, 0, 0, 0.6);
+        padding: 6px 10px;
+        border-radius: 4px;
+        font-size: 12px;
+        z-index: 101;
+      "
+    >
+      Connecting to audio server...
+    </div>
+    <button id="fullscreenBtn" class="fullscreen-btn" type="button" title="Toggle fullscreen">
+      Fullscreen
+    </button>
+
+    <script>
+      const canvas = document.getElementById("visualizer");
+      const ctx = canvas.getContext("2d");
+      const statusEl = document.getElementById("status");
+      const fullscreenBtn = document.getElementById("fullscreenBtn");
+      const host = window.location.hostname || "localhost";
+      const wsUrl = `ws://${host}:8765`;
+      let websocket = null;
+
+      let audioData = [];
+      let smoothedData = [];
+      let rawAudioData = [];
+      let peakLevels = [];
+      // Smoothing maps to attack/decay behavior
+      const DEFAULT_NUM_BARS = 64;
+      const DEFAULT_BAR_GAP = 10;
+      const DEFAULT_SHOW_PEAKS = true;
+      const DEFAULT_PEAK_FALLOFF_STEP = 0.1; // value units (0-100 scale) removed each frame when peaks fall
+      const PEAK_MARKER_HEIGHT = 4; // pixels
+      const DEFAULT_VISUALIZATION_MODE = "bars";
+      const DOT_MATRIX_ROWS = 20;
+      const TERRAIN_HISTORY = 60;
+      const PARTICLE_POOL_SIZE = 600;
+      const PARTICLE_MAX_EMISSION = 40;
+      const DEFAULT_PARTICLE_INTENSITY = 1.0;
+      const PARTICLE_GRAVITY = 260;
+
+      let smoothingFactor = 0.7;
+      let numBars = DEFAULT_NUM_BARS;
+      let sensitivity = 45000;
+      let colorMode = "rainbow";
+      let barGap = DEFAULT_BAR_GAP;
+      let showPeaks = DEFAULT_SHOW_PEAKS;
+      let peakFalloffStep = DEFAULT_PEAK_FALLOFF_STEP;
+      let visualizationMode = DEFAULT_VISUALIZATION_MODE;
+      let terrainHistory = [];
+      let particles = [];
+      let lastFrameTime =
+        typeof performance !== "undefined" ? performance.now() : Date.now();
+      let particleIntensity = DEFAULT_PARTICLE_INTENSITY;
+      let lastParticleBands = [];
+
+      // EQ-style parameters
+      let attackRate = 0.6; // lower = faster attack
+      let decayRate = 0.85; // higher = slower decay
+
+      // Set canvas size
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+
+      function connect() {
+        if (
+          websocket &&
+          (websocket.readyState === WebSocket.OPEN ||
+            websocket.readyState === WebSocket.CONNECTING)
+        ) {
+          return;
+        } else {
+          lastParticleBands = [];
+        }
+        statusEl.textContent = `Connecting to ${wsUrl}...`;
+        statusEl.style.display = "block";
+        websocket = new WebSocket(wsUrl);
+
+        websocket.onopen = () => {
+          // Hide status once connected; only show on errors/disconnects.
+          statusEl.textContent = "";
+          statusEl.style.display = "none";
+        };
+
+        websocket.onclose = () => {
+          statusEl.textContent = `Disconnected from ${wsUrl} — retrying...`;
+          statusEl.style.display = "block";
+          setTimeout(connect, 1500);
+        };
+
+        websocket.onerror = () => {
+          statusEl.textContent = `WebSocket error — check server (${wsUrl})`;
+          statusEl.style.display = "block";
+        };
+
+        websocket.onmessage = (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            if (Array.isArray(payload)) {
+              rawAudioData = payload;
+              processAudioData();
+            } else if (payload && payload.error) {
+              statusEl.textContent = `Server error: ${payload.error}`;
+              statusEl.style.display = "block";
+            }
+          } catch (err) {
+            console.error("Failed to parse audio data", err);
+          }
+        };
+      }
+
+      function processAudioData() {
+        // Downsample or group the data to match numBars (backend already ships log-spaced bands)
+        const groupSize = Math.ceil(rawAudioData.length / numBars);
+        const newData = [];
+
+        for (let i = 0; i < numBars; i++) {
+          let sum = 0;
+          let count = 0;
+          for (
+            let j = i * groupSize;
+            j < Math.min((i + 1) * groupSize, rawAudioData.length);
+            j++
+          ) {
+            sum += rawAudioData[j];
+            count++;
+          }
+          newData[i] = count > 0 ? (sum / count) * (sensitivity / 50000) : 0;
+        }
+
+        // Initialize arrays if needed
+        if (smoothedData.length !== numBars) {
+          smoothedData = [...newData];
+        } else {
+          // Apply EQ-style attack/decay
+          for (let i = 0; i < newData.length; i++) {
+            if (newData[i] > smoothedData[i]) {
+              // Fast attack - jump quickly to new higher values
+              smoothedData[i] =
+                smoothedData[i] * attackRate + newData[i] * (1 - attackRate);
+            } else {
+              // Slow decay - fall slowly from higher values
+              smoothedData[i] =
+                smoothedData[i] * decayRate + newData[i] * (1 - decayRate);
+            }
+          }
+        }
+
+        audioData = smoothedData;
+      }
+
+      function createRainbowGradient() {
+        const gradient = ctx.createLinearGradient(0, 0, canvas.width, 0);
+        const stops = [
+          [0, 0],
+          [0.25, 90],
+          [0.5, 180],
+          [0.75, 270],
+          [1, 360],
+        ];
+        stops.forEach(([stop, hue]) => {
+          gradient.addColorStop(stop, `hsl(${hue}, 100%, 50%)`);
+        });
+        return gradient;
+      }
+
+      function drawBars(barsCount) {
+        if (peakLevels.length !== barsCount) {
+          peakLevels = new Array(barsCount).fill(0);
+        }
+
+        const totalWidth = canvas.width;
+        const totalGaps = (barsCount - 1) * barGap;
+        const availableWidth = Math.max(0, totalWidth - totalGaps);
+        const barWidth = availableWidth / barsCount;
+
+        for (let i = 0; i < barsCount; i++) {
+          const value = i < audioData.length ? audioData[i] : 0;
+          const barHeight = (value / 100) * canvas.height;
+
+          if (value >= peakLevels[i]) {
+            peakLevels[i] = value;
+          } else {
+            peakLevels[i] = Math.max(0, peakLevels[i] - peakFalloffStep);
+          }
+
+          if (colorMode === "white") {
+            ctx.fillStyle = "white";
+          } else {
+            const hue = (i / Math.max(1, audioData.length)) * 360;
+            ctx.fillStyle = `hsl(${hue}, 100%, 50%)`;
+          }
+
+          const x = i * (barWidth + barGap);
+          const y = canvas.height - barHeight;
+
+          ctx.fillRect(x, y, barWidth, barHeight);
+
+          if (showPeaks) {
+            const peakHeight = (peakLevels[i] / 100) * canvas.height;
+            const peakY = Math.max(
+              0,
+              canvas.height - peakHeight - PEAK_MARKER_HEIGHT
+            );
+            ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+            ctx.fillRect(x, peakY, barWidth, PEAK_MARKER_HEIGHT);
+          }
+        }
+      }
+
+      function drawWave(pointsCount) {
+        const baseline = canvas.height;
+        const amplitude = canvas.height;
+        const divisor = Math.max(1, pointsCount - 1);
+        const step = canvas.width / divisor;
+
+        const getValue = (index) =>
+          index < audioData.length ? audioData[index] : 0;
+        const normalize = (value) =>
+          Math.max(0, Math.min(1, value / 100));
+
+        const points = [];
+        for (let i = 0; i < pointsCount; i++) {
+          const normalized = normalize(getValue(i));
+          const x = i * step;
+          const y = baseline - normalized * amplitude;
+          points.push({ x, y });
+        }
+
+        if (points.length === 0) {
+          return;
+        }
+
+        const buildFillPath = () => {
+          const path = new Path2D();
+          const first = points[0];
+          path.moveTo(first.x, baseline);
+          path.lineTo(first.x, first.y);
+
+          if (points.length === 1) {
+            path.lineTo(first.x, baseline);
+            path.closePath();
+            return path;
+          }
+
+          for (let i = 1; i < points.length - 1; i++) {
+            const current = points[i];
+            const next = points[i + 1];
+            const xc = (current.x + next.x) / 2;
+            const yc = (current.y + next.y) / 2;
+            path.quadraticCurveTo(current.x, current.y, xc, yc);
+          }
+
+          const penultimate = points[points.length - 2];
+          const last = points[points.length - 1];
+          path.quadraticCurveTo(penultimate.x, penultimate.y, last.x, last.y);
+          path.lineTo(last.x, baseline);
+          path.closePath();
+          return path;
+        };
+
+        const buildStrokePath = () => {
+          const path = new Path2D();
+          path.moveTo(points[0].x, points[0].y);
+
+          if (points.length === 1) {
+            return path;
+          }
+
+          for (let i = 1; i < points.length - 1; i++) {
+            const current = points[i];
+            const next = points[i + 1];
+            const xc = (current.x + next.x) / 2;
+            const yc = (current.y + next.y) / 2;
+            path.quadraticCurveTo(current.x, current.y, xc, yc);
+          }
+
+          const penultimate = points[points.length - 2];
+          const last = points[points.length - 1];
+          path.quadraticCurveTo(penultimate.x, penultimate.y, last.x, last.y);
+          return path;
+        };
+
+        const fillPath = buildFillPath();
+        if (colorMode === "white") {
+          ctx.fillStyle = "rgba(255, 255, 255, 0.12)";
+        } else {
+          const fillGradient = ctx.createLinearGradient(0, 0, 0, baseline);
+          fillGradient.addColorStop(0, "rgba(0, 200, 255, 0.15)");
+          fillGradient.addColorStop(1, "rgba(255, 0, 128, 0.15)");
+          ctx.fillStyle = fillGradient;
+        }
+        ctx.fill(fillPath);
+
+        const strokePath = buildStrokePath();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle =
+          colorMode === "white"
+            ? "rgba(255, 255, 255, 0.85)"
+            : createRainbowGradient();
+        ctx.stroke(strokePath);
+      }
+
+      function drawDots(pointsCount) {
+        if (pointsCount <= 0) {
+          return;
+        }
+
+        const rows = DOT_MATRIX_ROWS;
+        const totalGaps = (pointsCount - 1) * barGap;
+        const availableWidth = Math.max(0, canvas.width - totalGaps);
+        const columnWidth = pointsCount > 0 ? availableWidth / pointsCount : 0;
+        const columnStep = columnWidth + barGap;
+        const rowSpacing = canvas.height / rows;
+        const dotDiameter = Math.min(columnWidth || barGap || 4, rowSpacing) * 0.6;
+        const dotRadius = Math.max(2, dotDiameter / 2);
+
+        for (let i = 0; i < pointsCount; i++) {
+          const rawValue = i < audioData.length ? audioData[i] : 0;
+          const normalized = Math.max(0, Math.min(1, rawValue / 100));
+          const activeRows = Math.min(
+            rows,
+            normalized <= 0 ? 0 : Math.max(1, Math.ceil(normalized * rows))
+          );
+
+          const baseX = i * columnStep;
+          const columnX = baseX + (columnWidth > 0 ? columnWidth / 2 : dotRadius);
+          const hue = (i / Math.max(1, audioData.length)) * 360;
+
+          for (let row = 0; row < rows; row++) {
+            const y = canvas.height - (row + 0.5) * rowSpacing;
+            const isActive = row < activeRows;
+
+            if (colorMode === "white") {
+              ctx.fillStyle = isActive
+                ? "rgba(255, 255, 255, 0.9)"
+                : "rgba(255, 255, 255, 0.08)";
+            } else {
+              const saturation = isActive ? 100 : 60;
+              const lightness = isActive ? 55 : 18;
+              const alpha = isActive ? 0.95 : 0.25;
+              ctx.fillStyle = `hsla(${hue}, ${saturation}%, ${lightness}%, ${alpha})`;
+            }
+
+            ctx.beginPath();
+            ctx.arc(columnX, y, dotRadius, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+      }
+
+      function drawRadial(pointsCount) {
+        if (pointsCount <= 0) {
+          return;
+        }
+
+        const minDimension = Math.min(canvas.width, canvas.height);
+        const innerRadius = minDimension * 0.12;
+        const maxRadius = minDimension * 0.48;
+        const angleStep = (Math.PI * 2) / pointsCount;
+        const strokeWidth = Math.max(2, Math.min(12, angleStep * maxRadius * 0.45));
+
+        ctx.save();
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.lineCap = "round";
+        ctx.lineWidth = strokeWidth;
+
+        // Draw subtle inner disk
+        ctx.beginPath();
+        ctx.arc(0, 0, innerRadius * 0.65, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
+        ctx.fill();
+
+        for (let i = 0; i < pointsCount; i++) {
+          const rawValue = i < audioData.length ? audioData[i] : 0;
+          const normalized = Math.max(0, Math.min(1, rawValue / 100));
+          const radius = innerRadius + normalized * (maxRadius - innerRadius);
+          const angle = i * angleStep;
+          const cos = Math.cos(angle);
+          const sin = Math.sin(angle);
+          const innerX = cos * innerRadius;
+          const innerY = sin * innerRadius;
+          const outerX = cos * radius;
+          const outerY = sin * radius;
+
+          if (colorMode === "white") {
+            const opacity = 0.35 + normalized * 0.55;
+            ctx.strokeStyle = `rgba(255, 255, 255, ${opacity.toFixed(3)})`;
+          } else {
+            const hue = (i / Math.max(1, audioData.length)) * 360;
+            const lightness = 35 + normalized * 25;
+            ctx.strokeStyle = `hsl(${hue}, 90%, ${lightness}%)`;
+          }
+
+          ctx.beginPath();
+          ctx.moveTo(innerX, innerY);
+          ctx.lineTo(outerX, outerY);
+          ctx.stroke();
+
+          // optional glow tip
+          if (normalized > 0) {
+            const tipRadius = Math.max(3, Math.min(8, normalized * 12));
+            const gradient = ctx.createRadialGradient(
+              outerX,
+              outerY,
+              tipRadius * 0.25,
+              outerX,
+              outerY,
+              tipRadius
+            );
+            if (colorMode === "white") {
+              gradient.addColorStop(0, "rgba(255, 255, 255, 0.8)");
+              gradient.addColorStop(1, "rgba(255, 255, 255, 0)");
+            } else {
+              const hue = (i / Math.max(1, audioData.length)) * 360;
+              gradient.addColorStop(0, `hsla(${hue}, 100%, 65%, 0.9)`);
+              gradient.addColorStop(1, `hsla(${hue}, 100%, 65%, 0)`);
+            }
+            ctx.beginPath();
+            ctx.fillStyle = gradient;
+            ctx.arc(outerX, outerY, tipRadius, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+
+        ctx.restore();
+      }
+
+      function updateTerrainHistory(pointsCount) {
+        if (pointsCount <= 0) {
+          return;
+        }
+
+        const row = new Array(pointsCount).fill(0).map((_, index) => {
+          const value = index < audioData.length ? audioData[index] : 0;
+          return Math.max(0, Math.min(1, value / 100));
+        });
+
+        terrainHistory.unshift(row);
+        if (terrainHistory.length > TERRAIN_HISTORY) {
+          terrainHistory.pop();
+        }
+      }
+
+      function drawTerrain(pointsCount) {
+        updateTerrainHistory(pointsCount);
+
+        if (terrainHistory.length === 0) {
+          return;
+        }
+
+        ctx.save();
+        ctx.translate(canvas.width / 2, 0);
+
+        const horizonY = canvas.height * 0.25;
+        const baseY = canvas.height;
+        const layers = terrainHistory.length;
+
+        for (let layerIndex = layers - 1; layerIndex >= 0; layerIndex--) {
+          const row = terrainHistory[layerIndex];
+          if (!row || row.length < 2) {
+            continue;
+          }
+
+          const depth = layers > 1 ? 1 - layerIndex / (layers - 1) : 1;
+          const rowWidth = canvas.width * (0.4 + depth * 0.6);
+          const offsetX = -rowWidth / 2;
+          const step = rowWidth / (row.length - 1);
+          const baseline = horizonY + (baseY - horizonY) * depth;
+          const heightScale = canvas.height * 0.28 * (0.35 + depth * 0.9);
+          const alpha = Math.min(1, 0.1 + depth * 0.8);
+
+          const crestPath = new Path2D();
+          const fillPath = new Path2D();
+
+          fillPath.moveTo(offsetX, baseline);
+
+          for (let i = 0; i < row.length; i++) {
+            const normalized = row[i];
+            const x = offsetX + step * i;
+            const y = baseline - normalized * heightScale;
+
+            if (i === 0) {
+              crestPath.moveTo(x, y);
+              fillPath.lineTo(x, y);
+            } else {
+              crestPath.lineTo(x, y);
+              fillPath.lineTo(x, y);
+            }
+          }
+
+          fillPath.lineTo(offsetX + rowWidth, baseline);
+          fillPath.closePath();
+
+          if (colorMode === "white") {
+            const gradient = ctx.createLinearGradient(0, baseline, 0, baseline - heightScale);
+            gradient.addColorStop(0, `rgba(255, 255, 255, ${0.05 * alpha})`);
+            gradient.addColorStop(0.7, `rgba(255, 255, 255, ${0.2 * alpha})`);
+            gradient.addColorStop(1, `rgba(255, 255, 255, ${0.45 * alpha})`);
+            ctx.fillStyle = gradient;
+            ctx.strokeStyle = `rgba(255, 255, 255, ${0.35 + depth * 0.55})`;
+          } else {
+            const hueBase = 180 - depth * 120;
+            const gradient = ctx.createLinearGradient(0, baseline, 0, baseline - heightScale);
+            gradient.addColorStop(0, `hsla(${hueBase}, 70%, ${25 + depth * 20}%, ${0.3 * alpha})`);
+            gradient.addColorStop(0.6, `hsla(${hueBase + 30}, 80%, ${40 + depth * 30}%, ${0.45 * alpha})`);
+            gradient.addColorStop(1, `hsla(${hueBase + 80}, 90%, ${60 + depth * 25}%, ${0.6 * alpha})`);
+            ctx.fillStyle = gradient;
+            ctx.strokeStyle = `hsla(${hueBase + 90}, 85%, ${65 + depth * 20}%, ${0.65 + depth * 0.3})`;
+          }
+
+          ctx.globalAlpha = alpha;
+          ctx.fill(fillPath);
+
+          ctx.lineWidth = 1.5 + depth * 2.5;
+          ctx.stroke(crestPath);
+        }
+
+        ctx.globalAlpha = 1;
+        ctx.restore();
+      }
+
+      function updateParticleSystem(pointsCount, delta) {
+        if (pointsCount <= 0 || delta <= 0) {
+          return;
+        }
+
+        const hasAudio = audioData.length > 0;
+        if (hasAudio) {
+          const bandsCount = Math.min(pointsCount, audioData.length);
+          const normalized = new Array(bandsCount);
+          const bursts = new Array(bandsCount);
+          let sum = 0;
+          let weightedSum = 0;
+          let maxWeighted = 0;
+
+          for (let i = 0; i < bandsCount; i++) {
+            const value = Math.max(0, Math.min(1, audioData[i] / 100));
+            normalized[i] = value;
+            sum += value;
+            const previous = lastParticleBands[i] ?? 0;
+            const rise = Math.max(0, value - previous);
+            bursts[i] = rise;
+            const weighted = value * 0.65 + rise * 1.35;
+            weightedSum += weighted;
+            if (weighted > maxWeighted) {
+              maxWeighted = weighted;
+            }
+          }
+
+          lastParticleBands = normalized;
+
+          const average = bandsCount > 0 ? sum / bandsCount : 0;
+          const weightedAverage = bandsCount > 0 ? weightedSum / bandsCount : 0;
+          const emissionWeight = Math.min(
+            1,
+            average * 0.4 + weightedAverage * 0.4 + maxWeighted * 0.2
+          );
+          const spawnCount = Math.min(
+            PARTICLE_MAX_EMISSION,
+            emissionWeight > 0
+              ? Math.max(
+                  1,
+                  Math.floor(
+                    emissionWeight *
+                      PARTICLE_MAX_EMISSION *
+                      (0.6 + particleIntensity * 0.6)
+                  )
+                )
+              : 0
+          );
+
+          for (let i = 0; i < spawnCount; i++) {
+            const bandIndex = Math.floor(Math.random() * bandsCount);
+            const intensity = Math.max(0.05, normalized[bandIndex]);
+            const burst = bursts[bandIndex] ?? 0;
+            const speedMultiplier = 0.7 + particleIntensity * 0.5;
+            const velocityMagnitude =
+              (220 + intensity * 620) * speedMultiplier * (1 + burst * 3.2);
+            const spread = (Math.PI / 9) * (1.2 - intensity * 0.7);
+            const direction = -Math.PI / 2 + (Math.random() - 0.5) * spread;
+
+            const startX = Math.random() * canvas.width;
+            const startY =
+              canvas.height -
+              Math.random() * canvas.height * (0.18 + intensity * 0.22 + burst * 0.2);
+            const vx = Math.cos(direction) * velocityMagnitude;
+            const vy = Math.sin(direction) * velocityMagnitude;
+            const maxLife = 0.85 + Math.random() * 1.3 + burst * 0.6;
+            const size = 2 + intensity * 5 + burst * 8;
+
+            particles.push({
+              x: startX,
+              y: startY,
+              vx,
+              vy,
+              life: 0,
+              maxLife,
+              size,
+              hue: (bandIndex / Math.max(1, bandsCount)) * 360,
+            });
+          }
+
+          if (particles.length > PARTICLE_POOL_SIZE) {
+            particles.splice(0, particles.length - PARTICLE_POOL_SIZE);
+          }
+        }
+
+        particles = particles.filter((particle) => {
+          particle.life += delta;
+          particle.x += particle.vx * delta;
+          particle.y += particle.vy * delta;
+          particle.vx *= 0.992;
+          particle.vy += PARTICLE_GRAVITY * delta;
+
+          const stillVisible =
+            particle.life < particle.maxLife &&
+            particle.y < canvas.height + 60 &&
+            particle.x > -60 &&
+            particle.x < canvas.width + 60;
+          return stillVisible;
+        });
+      }
+
+      function renderParticles() {
+        if (particles.length === 0) {
+          return;
+        }
+
+        ctx.save();
+        ctx.globalCompositeOperation = "lighter";
+
+        for (const particle of particles) {
+          const lifeRatio = Math.min(1, particle.life / particle.maxLife);
+          const alpha = Math.max(0, 1 - lifeRatio);
+          if (alpha <= 0.01) {
+            continue;
+          }
+
+          const radius = particle.size * (0.6 + (1 - lifeRatio) * 0.6);
+
+          if (colorMode === "white") {
+            ctx.fillStyle = `rgba(255, 255, 255, ${(0.35 + alpha * 0.55).toFixed(
+              3
+            )})`;
+          } else {
+            const lightness = 55 + (1 - lifeRatio) * 25;
+            ctx.fillStyle = `hsla(${particle.hue.toFixed(1)}, 90%, ${lightness}%, ${(
+              0.25 + alpha * 0.6
+            ).toFixed(3)})`;
+          }
+
+          ctx.beginPath();
+          ctx.arc(particle.x, particle.y, radius, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        ctx.restore();
+      }
+
+      function drawParticleField(pointsCount, delta) {
+        updateParticleSystem(pointsCount, delta);
+        renderParticles();
+      }
+
+      function draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        const now =
+          typeof performance !== "undefined" ? performance.now() : Date.now();
+        const rawDelta = (now - lastFrameTime) / 1000;
+        const delta = Math.min(0.05, Math.max(0.016, rawDelta || 0.016));
+        lastFrameTime = now;
+
+        const dataPoints = Math.max(1, audioData.length || numBars);
+
+        if (visualizationMode === "waves") {
+          drawWave(dataPoints);
+        } else if (visualizationMode === "dots") {
+          drawDots(dataPoints);
+        } else if (visualizationMode === "radial") {
+          drawRadial(dataPoints);
+        } else if (visualizationMode === "terrain") {
+          drawTerrain(dataPoints);
+        } else if (visualizationMode === "particles") {
+          drawParticleField(dataPoints, delta);
+        } else {
+          drawBars(dataPoints);
+        }
+
+        requestAnimationFrame(draw);
+      }
+
+      function updateControlStates() {
+        const isBars = visualizationMode === "bars";
+        const supportsGap = visualizationMode === "bars" || visualizationMode === "dots";
+        const isParticles = visualizationMode === "particles";
+        const gapSlider = document.getElementById("gapSlider");
+        const peakToggleEl = document.getElementById("peakToggle");
+        const peakFalloffSlider = document.getElementById("peakFalloffSlider");
+        const peakGroup = document.getElementById("peakSettings");
+        const peakFalloffGroup = document.getElementById("peakFalloffGroup");
+        const gapGroup = document.getElementById("barGapGroup");
+        const particleIntensitySlider = document.getElementById(
+          "particleIntensitySlider"
+        );
+        const particleGroup = document.getElementById("particleIntensityGroup");
+
+        if (gapSlider) {
+          gapSlider.disabled = !supportsGap;
+        }
+
+        [peakToggleEl, peakFalloffSlider].forEach((el) => {
+          if (!el) return;
+          el.disabled = !isBars;
+        });
+
+        if (gapGroup) {
+          gapGroup.style.opacity = supportsGap ? 1 : 0.4;
+        }
+
+        [peakGroup, peakFalloffGroup].forEach((group) => {
+          if (!group) return;
+          group.style.opacity = isBars ? 1 : 0.4;
+        });
+
+        if (particleIntensitySlider) {
+          particleIntensitySlider.disabled = !isParticles;
+        }
+
+        if (particleGroup) {
+          particleGroup.style.opacity = isParticles ? 1 : 0.4;
+        }
+      }
+
+      // Control event listeners
+      document.getElementById("barsSlider").addEventListener("input", (e) => {
+        numBars = parseInt(e.target.value);
+        document.getElementById("barsValue").textContent = numBars;
+        smoothedData = []; // Reset smoothed data
+        peakLevels = [];
+        if (rawAudioData.length > 0) processAudioData();
+      });
+
+      document
+        .getElementById("smoothingSlider")
+        .addEventListener("input", (e) => {
+          smoothingFactor = parseFloat(e.target.value);
+          document.getElementById("smoothingValue").textContent =
+            smoothingFactor;
+          // Map smoothing to attack/decay:
+          // 0 => very fast (attack ~0.1, decay ~0.7)
+          // 0.95 => very smooth (attack ~0.9, decay ~0.98)
+          attackRate = 0.1 + smoothingFactor * 0.8;
+          decayRate = 0.7 + smoothingFactor * 0.28;
+        });
+
+      document
+        .getElementById("sensitivitySlider")
+        .addEventListener("input", (e) => {
+          sensitivity = parseInt(e.target.value);
+          document.getElementById("sensitivityValue").textContent = sensitivity;
+          if (rawAudioData.length > 0) processAudioData();
+        });
+
+      document.getElementById("colorMode").addEventListener("change", (e) => {
+        colorMode = e.target.value;
+      });
+
+      document
+        .getElementById("visualizationMode")
+        .addEventListener("change", (e) => {
+          visualizationMode = e.target.value;
+          peakLevels = [];
+          terrainHistory = [];
+          particles = [];
+          lastFrameTime =
+            typeof performance !== "undefined" ? performance.now() : Date.now();
+          lastParticleBands = [];
+          updateControlStates();
+        });
+
+      document.getElementById("gapSlider").addEventListener("input", (e) => {
+        barGap = parseInt(e.target.value);
+        document.getElementById("gapValue").textContent = barGap;
+      });
+
+      document
+        .getElementById("particleIntensitySlider")
+        .addEventListener("input", (e) => {
+          particleIntensity = parseFloat(e.target.value);
+          document.getElementById("particleIntensityValue").textContent =
+            particleIntensity.toFixed(2);
+        });
+
+      document.getElementById("peakToggle").addEventListener("change", (e) => {
+        showPeaks = e.target.checked;
+      });
+
+      document
+        .getElementById("peakFalloffSlider")
+        .addEventListener("input", (e) => {
+          peakFalloffStep = parseFloat(e.target.value);
+          document.getElementById("peakFalloffValue").textContent =
+            peakFalloffStep.toFixed(2);
+        });
+
+      // Initialize UI values from current controls
+      (function initControls() {
+        const barsEl = document.getElementById("barsSlider");
+        const smoothEl = document.getElementById("smoothingSlider");
+        const sensEl = document.getElementById("sensitivitySlider");
+        const gapEl = document.getElementById("gapSlider");
+        const peakFalloffEl = document.getElementById("peakFalloffSlider");
+        const peakToggleEl = document.getElementById("peakToggle");
+        const vizEl = document.getElementById("visualizationMode");
+        const particleIntensityEl = document.getElementById(
+          "particleIntensitySlider"
+        );
+
+        barsEl.value = DEFAULT_NUM_BARS;
+        numBars = parseInt(barsEl.value);
+        document.getElementById("barsValue").textContent = numBars;
+
+        smoothingFactor = parseFloat(smoothEl.value);
+        document.getElementById("smoothingValue").textContent = smoothingFactor;
+        attackRate = 0.1 + smoothingFactor * 0.8;
+        decayRate = 0.7 + smoothingFactor * 0.28;
+
+        sensitivity = parseInt(sensEl.value);
+        document.getElementById("sensitivityValue").textContent = sensitivity;
+
+        gapEl.value = DEFAULT_BAR_GAP;
+        barGap = parseInt(gapEl.value);
+        document.getElementById("gapValue").textContent = barGap;
+
+        peakFalloffEl.value = DEFAULT_PEAK_FALLOFF_STEP;
+        peakFalloffStep = parseFloat(peakFalloffEl.value);
+        document.getElementById("peakFalloffValue").textContent =
+          peakFalloffStep.toFixed(2);
+
+        peakToggleEl.checked = DEFAULT_SHOW_PEAKS;
+        showPeaks = peakToggleEl.checked;
+
+        if (particleIntensityEl) {
+          particleIntensity = parseFloat(particleIntensityEl.value);
+          document.getElementById("particleIntensityValue").textContent =
+            particleIntensity.toFixed(2);
+        } else {
+          particleIntensity = DEFAULT_PARTICLE_INTENSITY;
+        }
+
+        if (vizEl) {
+          visualizationMode = vizEl.value || DEFAULT_VISUALIZATION_MODE;
+          vizEl.value = visualizationMode;
+        } else {
+          visualizationMode = DEFAULT_VISUALIZATION_MODE;
+        }
+        updateControlStates();
+      })();
+
+      draw();
+
+      // Start WebSocket connection
+      connect();
+
+      window.addEventListener("resize", () => {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+      });
+
+      function updateFullscreenButton() {
+        const isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
+        fullscreenBtn.textContent = isFullscreen ? "Exit Fullscreen" : "Fullscreen";
+      }
+
+      fullscreenBtn.addEventListener("click", async () => {
+        try {
+          const isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
+          if (!isFullscreen) {
+            const request =
+              document.documentElement.requestFullscreen ||
+              document.documentElement.webkitRequestFullscreen;
+            if (request) {
+              await request.call(document.documentElement);
+            }
+          } else {
+            const exit = document.exitFullscreen || document.webkitExitFullscreen;
+            if (exit) {
+              await exit.call(document);
+            }
+          }
+        } catch (_err) {
+          // Some browsers require a direct user gesture or disallow fullscreen in certain contexts.
+        } finally {
+          updateFullscreenButton();
+        }
+      });
+
+      document.addEventListener("fullscreenchange", updateFullscreenButton);
+      document.addEventListener("webkitfullscreenchange", updateFullscreenButton);
+
+      if (
+        !document.documentElement.requestFullscreen &&
+        !document.documentElement.webkitRequestFullscreen
+      ) {
+        fullscreenBtn.disabled = true;
+        fullscreenBtn.style.opacity = "0.6";
+        fullscreenBtn.style.cursor = "not-allowed";
+        fullscreenBtn.title = "Fullscreen not supported in this browser";
+      }
+      updateFullscreenButton();
+    </script>
+  </body>
+</html>
