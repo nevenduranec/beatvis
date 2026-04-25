@@ -7,6 +7,7 @@ import os
 import sys
 import argparse
 import re
+import errno
 from typing import Optional
 
 CHUNK_FRAMES = 1024
@@ -35,6 +36,15 @@ def resolve_backend(backend: Optional[str]) -> str:
     if backend not in SUPPORTED_BACKENDS:
         return default_backend_for_platform()
     return backend
+
+
+def is_address_in_use_error(exc: OSError) -> bool:
+    if exc.errno == errno.EADDRINUSE:
+        return True
+    if exc.errno == 10048:
+        return True
+    message = str(exc).lower()
+    return "address already in use" in message
 
 
 def list_avfoundation_audio_devices() -> list[tuple[str, str]]:
@@ -567,6 +577,12 @@ async def main():
     )
     parser.add_argument('--host', default='localhost', help='WebSocket host (default: localhost)')
     parser.add_argument('--port', default=8765, type=int, help='WebSocket port (default: 8765)')
+    parser.add_argument(
+        "--port-retries",
+        default=int(os.getenv("AUDIO_PORT_RETRIES", "50")),
+        type=int,
+        help="Number of fallback ports to try when the selected port is busy (default: 50)",
+    )
     args = parser.parse_args()
 
     if args.list_devices:
@@ -626,7 +642,25 @@ async def main():
             channels=args.channels,
         )
 
-    async with websockets.serve(handler, args.host, args.port):
+    retries = max(args.port_retries, 0)
+    bound_port = args.port
+    server = None
+    for attempt in range(retries + 1):
+        candidate_port = args.port + attempt
+        try:
+            server = await websockets.serve(handler, args.host, candidate_port)
+            bound_port = candidate_port
+            if attempt > 0:
+                print(f"Port {args.port} is busy; using ws://{args.host}:{bound_port} instead.")
+            break
+        except OSError as exc:
+            if not is_address_in_use_error(exc) or attempt >= retries:
+                raise
+
+    if server is None:
+        return
+
+    try:
         backend = resolve_backend(args.backend)
         resolved = resolve_system_audio_device(
             backend,
@@ -634,11 +668,14 @@ async def main():
         )
         print(
             "WebSocket server started at "
-            f"ws://{args.host}:{args.port} "
+            f"ws://{args.host}:{bound_port} "
             f"(backend={backend}, device={args.device or os.getenv('AUDIO_DEVICE') or os.getenv('DEVICE') or 'default'} -> {resolved}, "
             f"rate={args.rate}, channels={args.channels})"
         )
         await asyncio.Future()  # Run forever
+    finally:
+        server.close()
+        await server.wait_closed()
 
 if __name__ == "__main__":
     try:

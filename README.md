@@ -1,8 +1,13 @@
-# Audio Levels (System Audio Visualizer)
+# Audio Levels
 
 Browser-based audio spectrum visualizer driven by a small Python WebSocket server.
 
-This project visualizes **system audio output** (not microphone input). Capturing system output requires a loopback setup that varies by OS.
+The app supports two capture modes:
+
+- **System Audio** via the local Python/WebSocket server and FFmpeg.
+- **Microphone** directly in the browser, including selectable external mic inputs.
+
+Capturing system output still requires a loopback setup that varies by OS.
 
 ## Requirements
 
@@ -30,6 +35,7 @@ make start
 ```
 
 The UI opens at `http://localhost:8000/index.html` and connects to `ws://localhost:8765`.
+Use the **Capture Source** selector in the UI to switch between system audio and browser microphone capture.
 
 ## Quick start (Windows)
 

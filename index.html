@@ -138,6 +138,19 @@
           <option value="particles">Particle Field</option>
         </select>
       </div>
+      <div class="control-group">
+        <label>Capture Source:</label>
+        <select id="captureSource">
+          <option value="server" selected>System Audio</option>
+          <option value="microphone">Microphone</option>
+        </select>
+      </div>
+      <div class="control-group" id="audioInputGroup">
+        <label>Mic Input:</label>
+        <select id="audioInputSelect">
+          <option value="">Default microphone</option>
+        </select>
+      </div>
       <div class="control-group" id="peakFalloffGroup">
         <label>Peak Falloff: <span class="value" id="peakFalloffValue">0.10</span></label>
         <input
@@ -202,9 +215,23 @@
       const ctx = canvas.getContext("2d");
       const statusEl = document.getElementById("status");
       const fullscreenBtn = document.getElementById("fullscreenBtn");
+      const captureSourceEl = document.getElementById("captureSource");
+      const audioInputGroupEl = document.getElementById("audioInputGroup");
+      const audioInputEl = document.getElementById("audioInputSelect");
+      const searchParams = new URLSearchParams(window.location.search);
       const host = window.location.hostname || "localhost";
-      const wsUrl = `ws://${host}:8765`;
+      const wsPort = searchParams.get("wsPort") || "8765";
+      const wsUrl = `ws://${host}:${wsPort}`;
+      const CAPTURE_SOURCE_SERVER = "server";
+      const CAPTURE_SOURCE_MICROPHONE = "microphone";
+      const supportsBrowserAudioCapture = !!(
+        navigator.mediaDevices &&
+        navigator.mediaDevices.getUserMedia &&
+        navigator.mediaDevices.enumerateDevices &&
+        (window.AudioContext || window.webkitAudioContext)
+      );
       let websocket = null;
+      let reconnectTimeoutId = null;
 
       let audioData = [];
       let smoothedData = [];
@@ -238,6 +265,14 @@
         typeof performance !== "undefined" ? performance.now() : Date.now();
       let particleIntensity = DEFAULT_PARTICLE_INTENSITY;
       let lastParticleBands = [];
+      let captureSource = CAPTURE_SOURCE_SERVER;
+      let selectedAudioInputId = "";
+      let browserAudioContext = null;
+      let browserAnalyser = null;
+      let browserFrequencyData = null;
+      let browserMediaStream = null;
+      let browserMediaSourceNode = null;
+      let micFrameId = null;
 
       // EQ-style parameters
       let attackRate = 0.6; // lower = faster attack
@@ -247,7 +282,46 @@
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
 
+      function setStatus(message) {
+        statusEl.textContent = message;
+        statusEl.style.display = message ? "block" : "none";
+      }
+
+      function hideStatus() {
+        setStatus("");
+      }
+
+      function resetAudioState() {
+        audioData = [];
+        smoothedData = [];
+        rawAudioData = [];
+        peakLevels = [];
+        terrainHistory = [];
+        particles = [];
+        lastParticleBands = [];
+      }
+
+      function closeWebSocketConnection() {
+        if (reconnectTimeoutId) {
+          clearTimeout(reconnectTimeoutId);
+          reconnectTimeoutId = null;
+        }
+
+        if (websocket) {
+          const socket = websocket;
+          websocket = null;
+          try {
+            socket.close();
+          } catch (_err) {
+            // Ignore close failures for stale sockets.
+          }
+        }
+      }
+
       function connect() {
+        if (captureSource !== CAPTURE_SOURCE_SERVER) {
+          return;
+        }
         if (
           websocket &&
           (websocket.readyState === WebSocket.OPEN ||
@@ -257,41 +331,260 @@
         } else {
           lastParticleBands = [];
         }
-        statusEl.textContent = `Connecting to ${wsUrl}...`;
-        statusEl.style.display = "block";
-        websocket = new WebSocket(wsUrl);
+        setStatus(`Connecting to ${wsUrl}...`);
+        const socket = new WebSocket(wsUrl);
+        websocket = socket;
 
-        websocket.onopen = () => {
+        socket.onopen = () => {
+          if (websocket !== socket) {
+            return;
+          }
           // Hide status once connected; only show on errors/disconnects.
-          statusEl.textContent = "";
-          statusEl.style.display = "none";
+          hideStatus();
         };
 
-        websocket.onclose = () => {
-          statusEl.textContent = `Disconnected from ${wsUrl} — retrying...`;
-          statusEl.style.display = "block";
-          setTimeout(connect, 1500);
+        socket.onclose = () => {
+          if (websocket === socket) {
+            websocket = null;
+          }
+          if (captureSource !== CAPTURE_SOURCE_SERVER) {
+            return;
+          }
+          setStatus(`Disconnected from ${wsUrl} — retrying...`);
+          reconnectTimeoutId = setTimeout(connect, 1500);
         };
 
-        websocket.onerror = () => {
-          statusEl.textContent = `WebSocket error — check server (${wsUrl})`;
-          statusEl.style.display = "block";
+        socket.onerror = () => {
+          if (websocket !== socket) {
+            return;
+          }
+          setStatus(`WebSocket error — check server (${wsUrl})`);
         };
 
-        websocket.onmessage = (event) => {
+        socket.onmessage = (event) => {
+          if (websocket !== socket) {
+            return;
+          }
           try {
             const payload = JSON.parse(event.data);
             if (Array.isArray(payload)) {
               rawAudioData = payload;
               processAudioData();
             } else if (payload && payload.error) {
-              statusEl.textContent = `Server error: ${payload.error}`;
-              statusEl.style.display = "block";
+              setStatus(`Server error: ${payload.error}`);
             }
           } catch (err) {
             console.error("Failed to parse audio data", err);
           }
         };
+      }
+
+      async function stopMicrophoneCapture() {
+        if (micFrameId) {
+          cancelAnimationFrame(micFrameId);
+          micFrameId = null;
+        }
+
+        if (browserMediaSourceNode) {
+          try {
+            browserMediaSourceNode.disconnect();
+          } catch (_err) {
+            // Node may already be disconnected.
+          }
+          browserMediaSourceNode = null;
+        }
+
+        if (browserAnalyser) {
+          try {
+            browserAnalyser.disconnect();
+          } catch (_err) {
+            // Analyzer may already be disconnected.
+          }
+          browserAnalyser = null;
+        }
+
+        if (browserMediaStream) {
+          browserMediaStream.getTracks().forEach((track) => track.stop());
+          browserMediaStream = null;
+        }
+
+        browserFrequencyData = null;
+
+        if (browserAudioContext) {
+          try {
+            await browserAudioContext.close();
+          } catch (_err) {
+            // Ignore close failures.
+          }
+          browserAudioContext = null;
+        }
+      }
+
+      function updateCaptureControlStates() {
+        const micOption = captureSourceEl.querySelector(
+          `option[value="${CAPTURE_SOURCE_MICROPHONE}"]`
+        );
+
+        if (micOption) {
+          micOption.disabled = !supportsBrowserAudioCapture;
+        }
+
+        if (!supportsBrowserAudioCapture && captureSource !== CAPTURE_SOURCE_SERVER) {
+          captureSource = CAPTURE_SOURCE_SERVER;
+          captureSourceEl.value = CAPTURE_SOURCE_SERVER;
+        }
+
+        const micActive =
+          captureSource === CAPTURE_SOURCE_MICROPHONE &&
+          supportsBrowserAudioCapture;
+        audioInputEl.disabled = !micActive;
+        audioInputGroupEl.style.opacity = micActive ? 1 : 0.4;
+      }
+
+      async function refreshAudioInputs(preferredDeviceId = selectedAudioInputId) {
+        if (!supportsBrowserAudioCapture) {
+          audioInputEl.innerHTML = '<option value="">Browser capture unavailable</option>';
+          audioInputEl.disabled = true;
+          return;
+        }
+
+        let devices = [];
+        try {
+          devices = await navigator.mediaDevices.enumerateDevices();
+        } catch (_err) {
+          devices = [];
+        }
+
+        const audioInputs = devices.filter((device) => device.kind === "audioinput");
+        const previousValue = audioInputEl.value;
+        audioInputEl.innerHTML = "";
+
+        const defaultOption = document.createElement("option");
+        defaultOption.value = "";
+        defaultOption.textContent = "Default microphone";
+        audioInputEl.appendChild(defaultOption);
+
+        audioInputs.forEach((device, index) => {
+          const option = document.createElement("option");
+          option.value = device.deviceId;
+          option.textContent = device.label || `Microphone ${index + 1}`;
+          audioInputEl.appendChild(option);
+        });
+
+        const candidateValue = [preferredDeviceId, previousValue, selectedAudioInputId].find(
+          (value) => !!value && audioInputs.some((device) => device.deviceId === value)
+        );
+        audioInputEl.value = candidateValue || "";
+        selectedAudioInputId = audioInputEl.value;
+        updateCaptureControlStates();
+      }
+
+      function pumpMicrophoneData() {
+        if (
+          captureSource !== CAPTURE_SOURCE_MICROPHONE ||
+          !browserAnalyser ||
+          !browserFrequencyData
+        ) {
+          micFrameId = null;
+          return;
+        }
+
+        browserAnalyser.getByteFrequencyData(browserFrequencyData);
+        rawAudioData = Array.from(
+          browserFrequencyData,
+          (value) => (value / 255) * 100
+        );
+        processAudioData();
+        micFrameId = requestAnimationFrame(pumpMicrophoneData);
+      }
+
+      async function startMicrophoneCapture(deviceId = selectedAudioInputId) {
+        if (!supportsBrowserAudioCapture) {
+          throw new Error("Browser microphone capture is not supported here.");
+        }
+
+        await stopMicrophoneCapture();
+        setStatus("Requesting microphone access...");
+
+        const audioConstraints = {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        };
+        if (deviceId) {
+          audioConstraints.deviceId = { exact: deviceId };
+        }
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: audioConstraints,
+        });
+
+        browserMediaStream = stream;
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        browserAudioContext = new AudioContextCtor();
+        await browserAudioContext.resume();
+
+        browserAnalyser = browserAudioContext.createAnalyser();
+        browserAnalyser.fftSize = 2048;
+        browserAnalyser.smoothingTimeConstant = 0;
+        browserFrequencyData = new Uint8Array(browserAnalyser.frequencyBinCount);
+
+        browserMediaSourceNode =
+          browserAudioContext.createMediaStreamSource(browserMediaStream);
+        browserMediaSourceNode.connect(browserAnalyser);
+
+        const activeTrack = browserMediaStream.getAudioTracks()[0];
+        const trackSettings =
+          activeTrack && typeof activeTrack.getSettings === "function"
+            ? activeTrack.getSettings()
+            : {};
+        selectedAudioInputId =
+          trackSettings.deviceId || deviceId || selectedAudioInputId || "";
+
+        resetAudioState();
+        await refreshAudioInputs(selectedAudioInputId);
+        hideStatus();
+        pumpMicrophoneData();
+      }
+
+      async function setCaptureSource(nextSource) {
+        if (
+          nextSource !== CAPTURE_SOURCE_SERVER &&
+          nextSource !== CAPTURE_SOURCE_MICROPHONE
+        ) {
+          return;
+        }
+
+        if (nextSource === captureSource) {
+          return;
+        }
+
+        captureSource = nextSource;
+        captureSourceEl.value = nextSource;
+        updateCaptureControlStates();
+        resetAudioState();
+
+        if (nextSource === CAPTURE_SOURCE_MICROPHONE) {
+          closeWebSocketConnection();
+          try {
+            await startMicrophoneCapture(audioInputEl.value);
+          } catch (err) {
+            const message =
+              err && typeof err.message === "string"
+                ? err.message
+                : "Unable to start microphone capture.";
+            await stopMicrophoneCapture();
+            captureSource = CAPTURE_SOURCE_SERVER;
+            captureSourceEl.value = CAPTURE_SOURCE_SERVER;
+            updateCaptureControlStates();
+            setStatus(`Microphone error: ${message}`);
+            connect();
+          }
+          return;
+        }
+
+        await stopMicrophoneCapture();
+        connect();
       }
 
       function processAudioData() {
@@ -965,6 +1258,23 @@
           updateControlStates();
         });
 
+      captureSourceEl.addEventListener("change", (e) => {
+        void setCaptureSource(e.target.value);
+      });
+
+      audioInputEl.addEventListener("change", (e) => {
+        selectedAudioInputId = e.target.value;
+        if (captureSource === CAPTURE_SOURCE_MICROPHONE) {
+          void startMicrophoneCapture(selectedAudioInputId).catch((err) => {
+            const message =
+              err && typeof err.message === "string"
+                ? err.message
+                : "Unable to switch microphone input.";
+            setStatus(`Microphone error: ${message}`);
+          });
+        }
+      });
+
       document.getElementById("gapSlider").addEventListener("input", (e) => {
         barGap = parseInt(e.target.value);
         document.getElementById("gapValue").textContent = barGap;
@@ -1002,6 +1312,7 @@
         const particleIntensityEl = document.getElementById(
           "particleIntensitySlider"
         );
+        const captureEl = document.getElementById("captureSource");
 
         barsEl.value = DEFAULT_NUM_BARS;
         numBars = parseInt(barsEl.value);
@@ -1041,13 +1352,30 @@
         } else {
           visualizationMode = DEFAULT_VISUALIZATION_MODE;
         }
+        captureSource = captureEl.value || CAPTURE_SOURCE_SERVER;
         updateControlStates();
+        updateCaptureControlStates();
       })();
 
       draw();
 
-      // Start WebSocket connection
-      connect();
+      async function initCapture() {
+        await refreshAudioInputs();
+
+        if (
+          supportsBrowserAudioCapture &&
+          navigator.mediaDevices &&
+          "addEventListener" in navigator.mediaDevices
+        ) {
+          navigator.mediaDevices.addEventListener("devicechange", () => {
+            void refreshAudioInputs();
+          });
+        }
+
+        connect();
+      }
+
+      void initCapture();
 
       window.addEventListener("resize", () => {
         canvas.width = window.innerWidth;
